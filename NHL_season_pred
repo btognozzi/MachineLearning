@@ -1,0 +1,268 @@
+# NHL total wins in a season prediciton
+import pandas as pd
+import requests
+import numpy as np
+import os
+import json
+import urllib.parse
+from functools import reduce
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.dummy import DummyRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from xgboost import XGBRegressor
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.pipeline import Pipeline
+from sklearn.feature_selection import SelectFromModel
+
+# I will start by collecting data using the NHL API
+
+base_url = 'https://api.nhle.com/stats/rest/en/team/'
+report_names = ['summary', 'goalsbyperiod', 'penalties', 'faceoffpercentages', 'scoretrailfirst']
+query_params = {'sort':'seasonId',
+                'cayenneExp':'seasonId>=19971998&seasonId<=20232024&gameTypeId=2',
+                'limit':'-1'}
+
+encoded_params = urllib.parse.urlencode(query_params,safe='&')
+
+save_path = '/Users/Bryce/Documents/Algorithms/MachineLearning'
+
+class GatherProcess:
+    def __init__(self, url, names, query, path):
+        self.url = url
+        self.names = names
+        self.query = query
+        self.path = path
+
+    def _get_data(self):
+        encoded_params = urllib.parse.urlencode(self.query, safe='&')
+        df_list = []
+        
+        for report in self.names:
+            full_url = f"{self.url}{report}?{encoded_params}"
+            response = requests.get(url=full_url)
+            file_name = os.path.join(self.path, f"{report}_data.csv")
+
+            if response.status_code == 200:
+                data = response.json()
+                report_df = pd.json_normalize(data['data'])
+                report_df.to_csv(file_name, index=False, mode='a', header=not os.path.exists(file_name))
+                print(f"Data for {report} saved successfully.")
+                df_list.append(report_df)
+            else:
+                print(f"Failed to retrieve data for {report} from NHL API.")
+        
+        return df_list
+
+    def _remove_redundant(self, df_list):
+        summary_columns = df_list[0].columns
+        cols_to_keep = ['seasonId', 'teamId']
+
+        for df in df_list:
+            redundant_cols = [col for col in df.columns if col in summary_columns and col not in cols_to_keep]
+            df.drop(columns=redundant_cols, inplace=True)
+
+        return df_list
+    
+    def _merge_dfs(self, df_list):
+        join_columns = ['seasonId', 'teamId']
+        merged_df = reduce(lambda left, right: pd.merge(left, right, on=join_columns), df_list)
+        
+        return merged_df
+
+    def _drop_cols(self, data):
+        NA_cols = [col for col in data.columns if data[col].isnull().any()]
+        data.drop(columns=NA_cols, inplace=True)
+        return data
+    
+    def perform_gather(self):
+        data_list = self._get_data()
+        processed_list = self._remove_redundant(data_list)
+        merged_df = self._merge_dfs(processed_list)
+        final_df = self._drop_cols(merged_df)
+        return final_df
+
+class FeatureExploration:
+    def __init__(self, df):
+        self.df = df
+
+    def bar_plot(self, x, y, hue = None, title = None, rotation = 30):
+        plt.figure(figsize=(10,6))
+        sns.barplot(data = self.df, x=x, y=y, hue=hue)
+        plt.ticks(size = 4, rotation = rotation, ha = 'right')
+        if title:
+            plt.title(title)
+        plt.show()
+
+    def scatter_plot(self, x, y, title = None):
+        plt.figure(figsize=(10,6))
+        sns.scatterplot(data=self.df, x=x, y=y)
+        if title:
+            plt.title(title)
+        plt.show()
+
+    def heatmap(self, drop_cols=None, cmap='coolwarm'):
+        plt.figure(figsize=(12, 8))
+        if drop_cols:
+            data_corr = self.df.drop(columns=drop_cols).corr()
+        else:
+            data_corr = self.df.corr()
+        sns.heatmap(data=data_corr, cmap=cmap, annot=True, fmt=".2f")
+        plt.show()
+
+class ModelWithSelection:
+    
+    def __init__(self, estimator, param_grid, cv):
+        self.estimator = estimator
+        self.param_grid = param_grid
+        self.cv = cv
+    
+    # Feature Engineering Method
+    def feature_engineering(self, df):
+        df['winPct'] = df['wins'] / df['gamesPlayed']
+        df['netGoalsPerGame'] = abs(df['goalsForPerGame'] - df['goalsAgainstPerGame'])
+        df['netShotsPerGame'] = abs(df['shotsForPerGame'] - df['shotsAgainstPerGame'])
+        df['period1netGoals'] = abs(df['period1GoalsFor'] - df['period1GoalsAgainst'])
+        df['period2netGoals'] = abs(df['period2GoalsFor'] - df['period2GoalsAgainst'])
+        df['period3netGoals'] = abs(df['period3GoalsFor'] - df['period3GoalsAgainst'])
+        
+        # Drop highly related variables
+        obv_cols = ['losses', 'teamFullName', 'seasonId', 'teamId', 'points', 'pointPct', 
+                    'regulationAndOtWins', 'winsInRegulation', 'winsInShootout', 'winsScoringFirst', 'winsTrailingFirst',
+                    'winPctScoringFirst', 'winPctTrailingFirst', 'lossesScoringFirst', 'lossesTrailingFirst',
+                    'otLossesScoringFirst', 'otLossesTrailingFirst', 'scoringFirstGamesPlayed', 'trailingFirstGamesPlayed',
+                    'tiesScoringFirst', 'tiesTrailingFirst', 'gamesPlayed', 'wins', 'goalsAgainstPerGame', 'goalsForPerGame']
+        
+        df = df.drop(columns=obv_cols)
+        
+        return df
+
+
+    def final_model_with_feature_selection(self, df, target):
+    
+        df = self.feature_engineering(df)
+        
+        X = df.drop(columns = [target])
+        y = df[target]
+        
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # Create Dummy Pipeline
+        dummy_pipeline = Pipeline(steps=[
+            ('scaler', StandardScaler()),
+            ('dummy', DummyRegressor(strategy='median'))
+        ])
+        
+        # Define the final pipeline steps
+        pipeline = Pipeline(steps=[
+            ('scaler', StandardScaler()),  # Scale the features
+            ('feature_selection', SelectFromModel(RandomForestRegressor(random_state=42))),  # Feature selection
+            ('model', self.estimator)  # Final model
+            ])
+
+        # Dummy predictions
+        dummy_pipeline.fit(X_train, y_train)
+        dummy_ypred = dummy_pipeline.predict(X_test)
+        
+        # Grid search over the pipeline
+        model = GridSearchCV(pipeline, param_grid=self.param_grid, cv=self.cv, n_jobs=-1)
+        model.fit(X_train, y_train)
+
+        # Predictions
+        y_train_pred = model.predict(X_train)
+        y_test_pred = model.predict(X_test)
+
+        # Dummy metrics
+        print("Dummy R2 Score:", r2_score(y_true=y_test, y_pred=dummy_ypred))
+        print("Dummy MSE: ", mean_squared_error(y_true=y_test, y_pred=dummy_ypred))
+
+        # Training metrics
+        print("Train R2 Score: ", r2_score(y_true=y_train, y_pred=y_train_pred))
+        print("Train MSE: ", mean_squared_error(y_true=y_train, y_pred=y_train_pred))
+
+        # Testing metrics
+        print("Test R2 Score: ", r2_score(y_true=y_test, y_pred=y_test_pred))
+        print("Test MSE: ", mean_squared_error(y_true=y_test, y_pred=y_test_pred))
+
+        print("Best CV Score:", model.best_score_)
+
+        self.X_test = X_test
+        self.y_test = y_test
+        self.y_test_pred = y_test_pred
+        self.best_estimator_ = model.best_estimator_
+        
+        return self.best_estimator_
+    
+    def plot_results(self):
+        if hasattr(self, 'X_test') and hasattr(self, 'y_test') and hasattr(self, 'y_test_pred'):
+            # Calculate MSE for each point
+            mse = (self.y_test - self.y_test_pred) ** 2
+            
+            # Plot Actual vs Predicted with color gradient based on MSE
+            plt.figure(figsize=(8, 6))
+            scatter = plt.scatter(self.y_test, self.y_test_pred, c=mse, cmap='viridis', s=100, edgecolor='k', alpha=0.7)
+            plt.plot([self.y_test.min(), self.y_test.max()], [self.y_test.min(), self.y_test.max()], 'r--', lw=2)
+            plt.xlabel("Actual")
+            plt.ylabel("Predicted")
+            plt.title("Actual vs Predicted (Colored by MSE)")
+            plt.colorbar(scatter, label='MSE')
+            plt.show()
+        else:
+            print("No model results available. Please run final_model_with_feature_selection first.")
+
+
+df = GatherProcess.perform_gather()
+
+# Various graphing functions
+# FeatureExploration.scatter_plot()
+# FeatureExploration.bar_plot()
+# FeatureExploration.heatmap()
+
+# We can see that over the last few years the average goalsFor for the NHL has been increased over the last few years
+
+# We can see that there are less match penalties called on average for the most current seasons (2022-present) compared to earlier (1997-2005)
+# But there is a steep uptrend over the last couple of years.
+
+# We can see that the Vegas Golden Knights have the highest wins on average, however, they have only been a NHL team since 2017.
+# So, their average wins are skewed compared to STL, DET, or any of the other older NHL teams.
+# The same is true for Seattle which became a team in 2021.
+
+
+param_grid = {
+    'n_estimators': [500, 600, 700],
+    'max_depth': [6, 7, 8],
+    'grow_policy': ['lossguide'],
+    'learning_rate': [0.001],
+    'objective': ['reg:squarederror', 'reg:absoluteerror'],
+    'min_child_weight': [5, 6, 7],
+    'reg_alpha': [120],
+    'reg_lambda': [25, 30]
+}
+
+param_grid_2 = {
+    'n_estimators': [100, 200, 300],
+    'criterion': ['squared_error', 'absolute_error'],
+    'max_depth': [5, 6, 7, 8],
+    'min_samples_split': [8, 9, 10],
+    'min_samples_leaf': [8, 9, 10],
+    'max_leaf_nodes': [2, 3, 4]
+}
+
+model_selection = ModelWithSelection(
+    estimator=RandomForestRegressor(random_state=42),
+    param_grid=param_grid_2,
+    cv=5
+)
+
+model_selection2 = ModelWithSelection(
+    estimator=XGBRegressor(random_state=42),
+    param_grid=param_grid,
+    cv=5
+)
+
+model1 = model_selection.final_model_with_feature_selection(df, 'winPct')
+model_selection.plot_results()
+model2 = model_selection2.final_model_with_feature_selection(df, 'winPct')
+model_selection2.plot_results()
